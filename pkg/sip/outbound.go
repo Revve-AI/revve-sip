@@ -20,6 +20,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -102,7 +103,12 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 	tr := TransportFrom(sipConf.transport)
 	contact := c.ContactURI(tr)
 	if sipConf.host == "" {
-		sipConf.host = contact.GetHost()
+		if strings.Contains(sipConf.address, "stringee") {
+			// Support stringee SIP provider in Vietnam
+			sipConf.host = "v2.stringee.com"
+		} else {
+			sipConf.host = contact.GetHost()
+		}
 	}
 	call := &outboundCall{
 		c:         c,
@@ -116,8 +122,14 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 	}
 	call.stats.Update()
 	call.log = call.log.WithValues("jitterBuf", call.jitterBuf)
+
+	user := sipConf.from
+	// Support Vietnamese SIP providers
+	if conf.IsVietnameseProvider(sipConf.address) {
+		user = sipConf.user
+	}
 	call.cc = c.newOutbound(log, id, URI{
-		User:      sipConf.from,
+		User:      user,
 		Host:      sipConf.host,
 		Addr:      contact.Addr,
 		Transport: tr,
@@ -725,9 +737,20 @@ func (c *Client) newOutbound(log logger.Logger, id LocalTag, from, contact URI, 
 		displayName = &from.User
 	}
 
+	fromURI := *from.GetURI()
+	// Remove port from URI for Vietnamese providers
+	if c.conf.IsVietnameseProvider(fromURI.String()) {
+		fromURI = sip.Uri{
+			Scheme: from.GetURI().Scheme,
+			User:   from.GetURI().User,
+			Host:   from.GetURI().Host,
+			// Deliberately omit Port field
+		}
+	}
+
 	fromHeader := &sip.FromHeader{
 		DisplayName: *displayName,
-		Address:     *from.GetURI(),
+		Address:     fromURI,
 		Params:      sip.NewParams(),
 	}
 	contactHeader := &sip.ContactHeader{
@@ -1023,26 +1046,265 @@ func (c *sipOutbound) setCSeq(req *sip.Request) {
 
 func (c *sipOutbound) sendBye(ctx context.Context) {
 	ctx = context.WithoutCancel(ctx)
+	// Validate we have necessary SIP dialog info
 	if c.invite == nil || c.inviteOk == nil {
-		return // call wasn't established
+		c.log.Warnw("cannot send BYE - call not properly established", nil,
+			"hasInvite", c.invite != nil,
+			"hasInviteOk", c.inviteOk != nil,
+		)
+		return
 	}
+
+	c.log.Infow("starting BYE process",
+		"callID", c.callID,
+		"remoteTag", c.tag,
+		"localTag", c.id,
+	)
+
+	defer c.drop()
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
 	ctx, span := Tracer.Start(ctx, "sip.outbound.sendBye")
 	defer span.End()
-	r := sip.NewByeRequest(c.invite, c.inviteOk, nil)
+
+	// Validate SIP state
+	if c.callID == "" {
+		c.log.Errorw("cannot send BYE - missing call ID", nil)
+		return
+	}
+
+	// Create BYE request using Contact from 200 OK
+	r := newByeRequestForVietnameseProvider(c.invite, c.inviteOk, nil)
+	if r == nil {
+		c.log.Errorw("failed to create BYE request", nil)
+		return
+	}
+
+	// Update CSeq with our tracking
+	c.setCSeq(r)
+
+	// Add User-Agent header
 	r.AppendHeader(sip.NewHeader("User-Agent", "LiveKit"))
+
+	// Add any custom headers from callback
 	if c.getHeaders != nil {
 		for k, v := range c.getHeaders(nil) {
 			r.AppendHeader(sip.NewHeader(k, v))
 		}
 	}
+
+	// Log the BYE request details
+	c.log.Infow("sending BYE request",
+		"recipient", r.Recipient.String(),
+		"callID", r.CallID().Value(),
+		"from", r.From().Value(),
+		"to", r.To().Value(),
+		"cseq", fmt.Sprintf("%d %s", r.CSeq().SeqNo, r.CSeq().MethodName),
+		"destination", r.Destination(),
+	)
+
+	// Check if client is already closing
 	if c.c.closing.IsBroken() {
-		// do not wait for a response
-		_ = c.WriteRequest(r)
+		c.log.Infow("client is closing, sending BYE without waiting for response")
+		err := c.WriteRequest(r)
+		if err != nil {
+			c.log.Errorw("failed to write BYE request during shutdown", err)
+		}
 		return
 	}
-	c.setCSeq(r)
-	c.drop()
-	sendAndACK(ctx, c, r)
+
+	// Try to send BYE with retries
+	maxRetries := 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Wait before retry with exponential backoff
+			delay := time.Duration(attempt) * 500 * time.Millisecond
+			c.log.Infow("waiting before BYE retry",
+				"attempt", attempt+1,
+				"delay", delay,
+			)
+
+			select {
+			case <-ctx.Done():
+				c.log.Warnw("BYE cancelled due to timeout", nil)
+				return
+			case <-time.After(delay):
+				// Continue with retry
+			}
+		}
+
+		c.log.Infow("sending BYE attempt",
+			"attempt", attempt+1,
+			"maxRetries", maxRetries,
+		)
+
+		// Try to send BYE and wait for response
+		lastErr = sendAndACK(ctx, c, r)
+		if lastErr == nil {
+			c.log.Infow("BYE completed successfully", "attempt", attempt+1)
+			return
+		}
+
+		c.log.Warnw("BYE attempt failed", lastErr,
+			"attempt", attempt+1,
+			"error", lastErr.Error(),
+		)
+
+		// Check if error is non-retryable
+		errStr := lastErr.Error()
+
+		// Don't retry on authentication failures or explicit rejections
+		if strings.Contains(errStr, "401") ||
+			strings.Contains(errStr, "403") ||
+			strings.Contains(errStr, "404") ||
+			strings.Contains(errStr, "481") { // Call Does Not Exist
+			c.log.Infow("received non-retryable error response, stopping BYE attempts",
+				"error", errStr,
+			)
+			return
+		}
+
+		// Try direct write if transaction creation failed
+		if strings.Contains(errStr, "failed to create SIP transaction") {
+			c.log.Infow("attempting direct BYE write without transaction")
+
+			writeErr := c.WriteRequest(r)
+			if writeErr == nil {
+				// Wait a bit to see if we get a response
+				select {
+				case <-ctx.Done():
+					c.log.Infow("direct BYE write sent, context expired")
+				case <-time.After(2 * time.Second):
+					c.log.Infow("direct BYE write sent, no response received")
+				}
+				return
+			}
+
+			c.log.Warnw("direct BYE write failed", writeErr)
+			lastErr = writeErr
+		}
+	}
+
+	// All attempts failed
+	c.log.Errorw("all BYE attempts failed", lastErr,
+		"maxRetries", maxRetries,
+		"callID", c.callID,
+		"recipient", r.Recipient.String(),
+	)
+
+	// As last resort, try one final direct write without waiting
+	c.log.Infow("attempting final BYE write without waiting for response")
+	finalErr := c.WriteRequest(r)
+	if finalErr != nil {
+		c.log.Errorw("final BYE write also failed", finalErr)
+	} else {
+		c.log.Infow("final BYE write sent")
+	}
+}
+
+// newByeRequestForVietnameseProvider creates a BYE request using Contact from 200 OK response
+// This is needed for Vietnamese providers like Stringee that require proper Contact handling
+func newByeRequestForVietnameseProvider(inviteRequest *sip.Request, inviteResponse *sip.Response, body []byte) *sip.Request {
+	// Use Contact from 200 OK response as the Request-URI for BYE
+	var recipient *sip.Uri
+	if inviteResponse != nil && inviteResponse.Contact() != nil {
+		// BYE should go directly to the Contact address from 200 OK
+		recipient = inviteResponse.Contact().Address.Clone()
+	} else {
+		// Fallback to original recipient if no Contact header
+		recipient = inviteRequest.Recipient.Clone()
+	}
+
+	// Create BYE request with correct recipient
+	byeRequest := sip.NewRequest(sip.BYE, *recipient)
+	byeRequest.SipVersion = inviteRequest.SipVersion
+
+	// Via header - copy from INVITE but with new branch
+	if via := inviteRequest.Via(); via != nil {
+		viaClone := via.Clone()
+		viaClone.Params.Add("branch", sip.GenerateBranch())
+		byeRequest.AppendHeader(viaClone)
+	}
+
+	// Max-Forwards
+	maxForwardsHeader := sip.MaxForwardsHeader(70)
+	byeRequest.AppendHeader(&maxForwardsHeader)
+
+	// Route headers: Process Record-Route from response
+	if inviteResponse != nil {
+		recordRoutes := inviteResponse.GetHeaders("Record-Route")
+		if len(recordRoutes) > 0 {
+			// Add Route headers in reverse order of Record-Route
+			for i := len(recordRoutes) - 1; i >= 0; i-- {
+				if rr, ok := recordRoutes[i].(*sip.RecordRouteHeader); ok {
+					routeHeader := &sip.RouteHeader{
+						Address: *rr.Address.Clone(),
+					}
+					byeRequest.AppendHeader(routeHeader)
+				}
+			}
+		}
+	}
+
+	// Contact header - use from original INVITE (our address)
+	if contact := inviteRequest.Contact(); contact != nil {
+		byeRequest.AppendHeader(sip.HeaderClone(contact))
+	}
+
+	// To header - MUST use from response (includes remote tag)
+	if inviteResponse != nil && inviteResponse.To() != nil {
+		byeRequest.AppendHeader(sip.HeaderClone(inviteResponse.To()))
+	} else if inviteRequest.To() != nil {
+		byeRequest.AppendHeader(sip.HeaderClone(inviteRequest.To()))
+	}
+
+	// From header - use from INVITE (includes our tag)
+	if from := inviteRequest.From(); from != nil {
+		byeRequest.AppendHeader(sip.HeaderClone(from))
+	}
+
+	// Call-ID - must be same as INVITE
+	if callID := inviteRequest.CallID(); callID != nil {
+		byeRequest.AppendHeader(sip.HeaderClone(callID))
+	}
+
+	// CSeq - increment sequence number and set method to BYE
+	if cseq := inviteRequest.CSeq(); cseq != nil {
+		newCSeq := &sip.CSeqHeader{
+			SeqNo:      cseq.SeqNo + 2, // +2 because ACK was +1
+			MethodName: sip.BYE,
+		}
+		byeRequest.AppendHeader(newCSeq)
+	}
+
+	// Set body if provided
+	if body != nil && len(body) > 0 {
+		byeRequest.SetBody(body)
+	}
+
+	// Transport settings
+	byeRequest.SetTransport(inviteRequest.Transport())
+	byeRequest.SetSource(inviteRequest.Source())
+
+	// Set destination based on Contact from 200 OK or original destination
+	if inviteResponse != nil && inviteResponse.Contact() != nil {
+		contact := inviteResponse.Contact()
+		port := contact.Address.Port
+		if port == 0 {
+			port = 5060 // Default SIP port
+		}
+		dest := fmt.Sprintf("%s:%d", contact.Address.Host, port)
+		byeRequest.SetDestination(dest)
+	} else {
+		byeRequest.SetDestination(inviteRequest.Destination())
+	}
+
+	return byeRequest
 }
 
 func (c *sipOutbound) sendCancel(ctx context.Context) {

@@ -80,6 +80,8 @@ func BuildDocker() error {
 	)
 }
 
+// docker build --platform linux/amd64 -t asia-southeast1-docker.pkg.dev/revve-infra-prod/revve-repo/revve-sip:v25 -f build/sip/Dockerfile .
+
 func BuildDockerLinux() error {
 	return mageutil.Run(context.Background(),
 		fmt.Sprintf("docker build --platform linux/amd64 -t %s:latest -f build/sip/Dockerfile .", imageName),

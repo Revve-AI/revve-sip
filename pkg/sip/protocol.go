@@ -26,6 +26,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 	"github.com/livekit/psrpc"
 	"github.com/livekit/sipgo/sip"
 
@@ -194,19 +195,54 @@ func getContactURI(c *config.Config, ip netip.Addr, t Transport) URI {
 	}
 }
 
-func sendAndACK(ctx context.Context, c Signaling, req *sip.Request) {
+func sendAndACK(ctx context.Context, c Signaling, req *sip.Request) error {
+	// Log the request details
+	log := logger.GetLogger().WithValues(
+		"method", req.Method.String(),
+		"recipient", req.Recipient.String(),
+		"callID", req.CallID().Value(),
+	)
+
+	log.Infow("attempting to send SIP request")
+
 	tx, err := c.Transaction(req)
 	if err != nil {
-		return
+		log.Errorw("failed to create SIP transaction", err)
+		return fmt.Errorf("failed to create SIP transaction: %w", err)
 	}
 	defer tx.Terminate()
+
+	log.Infow("SIP transaction created, waiting for response")
+
 	r, err := sipResponse(ctx, tx, nil, nil)
 	if err != nil {
-		return
+		log.Errorw("failed to get SIP response", err)
+		return fmt.Errorf("failed to get SIP response: %w", err)
 	}
+
+	log.Infow("received SIP response",
+		"statusCode", r.StatusCode,
+		"reason", r.Reason,
+	)
+
 	if r.StatusCode == 200 {
-		_ = c.WriteRequest(sip.NewAckRequest(req, r, nil))
+		log.Infow("sending ACK for successful response")
+		err = c.WriteRequest(sip.NewAckRequest(req, r, nil))
+		if err != nil {
+			log.Errorw("failed to send ACK", err)
+			return fmt.Errorf("failed to send ACK: %w", err)
+		}
+		log.Infow("ACK sent successfully")
+	} else {
+		log.Warnw("request failed with non-200 status", nil,
+			"statusCode", r.StatusCode,
+			"reason", r.Reason,
+			"body", string(r.Body()),
+		)
+		return fmt.Errorf("request failed with status %d: %s", r.StatusCode, r.Reason)
 	}
+
+	return nil
 }
 
 func NewReferRequest(inviteRequest *sip.Request, inviteResponse *sip.Response, contactHeader *sip.ContactHeader, referToUrl string, headers map[string]string) *sip.Request {
