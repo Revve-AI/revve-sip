@@ -363,7 +363,9 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	checkDur := cmon.CheckDur()
 	checked := func() {
 		checkDurOnce.Do(func() {
-			checkDur.Observe(time.Since(start).Seconds())
+			dur := time.Since(start)
+			checkDur.Observe(dur.Seconds())
+			log.Infow("SIP check duration (INVITE to dispatch response)", "dur_check", dur)
 		})
 	}
 	defer checked()
@@ -1315,7 +1317,8 @@ func (c *inboundCall) publishTrack() error {
 
 func (c *inboundCall) joinRoom(ctx context.Context, rconf RoomConfig, status CallStatus) error {
 	if c.joinDur != nil {
-		c.joinDur()
+		dur := c.joinDur()
+		c.log().Infow("SIP join duration (INVITE to mixed room audio)", "dur_join", dur)
 	}
 	c.callDur = c.mon.CallDur()
 	c.appendLogValues(

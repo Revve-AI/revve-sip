@@ -17,6 +17,7 @@ package sip
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -44,6 +45,7 @@ import (
 const (
 	defaultMediaTimeout        = 15 * time.Second
 	defaultMediaTimeoutInitial = 30 * time.Second
+	mediaQualityLogInterval    = 30 * time.Second
 )
 
 type PortStatsSnapshot struct {
@@ -77,6 +79,8 @@ type PortStatsSnapshot struct {
 	DTMFPackets uint64 `json:"dtmf_packets"`
 	DTMFBytes   uint64 `json:"dtmf_bytes"`
 
+	WriteErrors uint64 `json:"write_errors"`
+
 	Closed bool `json:"closed"`
 }
 
@@ -101,6 +105,8 @@ type PortStats struct {
 
 	DTMFPackets atomic.Uint64
 	DTMFBytes   atomic.Uint64
+
+	WriteErrors atomic.Uint64
 
 	Closed atomic.Bool
 
@@ -138,6 +144,7 @@ func (s *PortStats) Load() PortStatsSnapshot {
 		AudioTX:           math.Float64frombits(s.AudioTX.Load()),
 		DTMFPackets:       s.DTMFPackets.Load(),
 		DTMFBytes:         s.DTMFBytes.Load(),
+		WriteErrors:       s.WriteErrors.Load(),
 		Closed:            s.Closed.Load(),
 	}
 }
@@ -183,9 +190,11 @@ func newUDPConn(log logger.Logger, conn UDPConn) *udpConn {
 
 type udpConn struct {
 	UDPConn
-	log logger.Logger
-	src atomic.Pointer[netip.AddrPort]
-	dst atomic.Pointer[netip.AddrPort]
+	log             logger.Logger
+	src             atomic.Pointer[netip.AddrPort]
+	dst             atomic.Pointer[netip.AddrPort]
+	writeErrors     atomic.Uint64
+	lastWriteErrLog atomic.Int64 // unix ms
 }
 
 func (c *udpConn) GetSrc() (netip.AddrPort, bool) {
@@ -224,7 +233,18 @@ func (c *udpConn) Write(b []byte) (n int, err error) {
 	if dst == nil {
 		return len(b), nil // ignore
 	}
-	return c.WriteToUDPAddrPort(b, *dst)
+	n, err = c.WriteToUDPAddrPort(b, *dst)
+	if err != nil {
+		c.writeErrors.Add(1)
+		now := time.Now().UnixMilli()
+		lastLog := c.lastWriteErrLog.Load()
+		if now-lastLog > 1000 {
+			if c.lastWriteErrLog.CompareAndSwap(lastLog, now) {
+				c.log.Warnw("UDP media write error", err, "dst", dst.String(), "writeErrors", c.writeErrors.Load())
+			}
+		}
+	}
+	return n, err
 }
 
 type MediaConf struct {
@@ -616,7 +636,97 @@ func (p *MediaPort) SetConfig(c *MediaConf) error {
 		return err
 	}
 	p.setupInput()
+	go p.mediaQualityLoop()
 	return nil
+}
+
+func (p *MediaPort) mediaQualityLoop() {
+	ticker := time.NewTicker(mediaQualityLogInterval)
+	defer ticker.Stop()
+
+	type snapshot struct {
+		packets        uint64
+		gaps           uint64
+		gapsSum        uint64
+		late           uint64
+		lateSum        uint64
+		delayedPackets uint64
+		delayedSum     uint64
+		rapidPackets   uint64
+		resets         uint64
+		writeErrors    uint64
+	}
+
+	takeSS := func() snapshot {
+		return snapshot{
+			packets:        p.stats.MuxStats.packets.Load(),
+			gaps:           p.stats.MuxStats.gaps.Load(),
+			gapsSum:        p.stats.MuxStats.gapsSum.Load(),
+			late:           p.stats.MuxStats.late.Load(),
+			lateSum:        p.stats.MuxStats.lateSum.Load(),
+			delayedPackets: p.stats.MuxStats.delayedPackets.Load(),
+			delayedSum:     p.stats.MuxStats.delayedSum.Load(),
+			rapidPackets:   p.stats.MuxStats.rapidPackets.Load(),
+			resets:         p.stats.MuxStats.resets.Load(),
+			writeErrors:    p.port.writeErrors.Load(),
+		}
+	}
+
+	prev := takeSS()
+	for {
+		select {
+		case <-p.closed.Watch():
+			return
+		case <-ticker.C:
+			cur := takeSS()
+
+			dPackets := cur.packets - prev.packets
+			dGaps := cur.gaps - prev.gaps
+			dGapsSum := cur.gapsSum - prev.gapsSum
+			dLate := cur.late - prev.late
+			dDelayed := cur.delayedPackets - prev.delayedPackets
+			dDelayedSum := cur.delayedSum - prev.delayedSum
+			dRapid := cur.rapidPackets - prev.rapidPackets
+			dResets := cur.resets - prev.resets
+			dWriteErrors := cur.writeErrors - prev.writeErrors
+
+			var lossRate float64
+			if dPackets > 0 {
+				lossRate = float64(dGapsSum) / float64(dPackets+dGapsSum) * 100
+			}
+			var avgDelayMs float64
+			if dDelayed > 0 {
+				avgDelayMs = float64(dDelayedSum) / float64(dDelayed)
+			}
+
+			p.stats.Update()
+			st := p.stats.Load()
+
+			fields := []any{
+				"interval", mediaQualityLogInterval,
+				"rxPackets", dPackets,
+				"packetLoss", dGapsSum,
+				"packetLossRate", fmt.Sprintf("%.1f%%", lossRate),
+				"latePackets", dLate,
+				"delayedPackets", dDelayed,
+				"avgDelayMs", fmt.Sprintf("%.1f", avgDelayMs),
+				"rapidPackets", dRapid,
+				"rtpResets", dResets,
+				"writeErrors", dWriteErrors,
+				"audioRxHz", fmt.Sprintf("%.0f", st.AudioRX),
+				"audioTxHz", fmt.Sprintf("%.0f", st.AudioTX),
+				"gaps", dGaps,
+			}
+
+			if lossRate > 5 || dResets > 0 || dWriteErrors > 0 {
+				p.log.Warnw("media quality degraded", nil, fields...)
+			} else {
+				p.log.Infow("media quality", fields...)
+			}
+
+			prev = cur
+		}
+	}
 }
 
 func (p *MediaPort) rtpLoop(tid traceid.ID, sess rtp.Session) {
@@ -713,7 +823,7 @@ func (p *MediaPort) setupOutput(tid traceid.ID) error {
 	}
 
 	codecInfo := p.conf.Audio.Codec.Info()
-	w = newRTPStatsWriter(p.mon, p.conf.Audio.Type, p.conf.Audio.DTMFType, codecInfo.SDPName, dtmf.SDPName, w)
+	w = newRTPStatsWriter(p.log, p.mon, p.conf.Audio.Type, p.conf.Audio.DTMFType, codecInfo.SDPName, dtmf.SDPName, w, &p.stats.WriteErrors)
 	s := rtp.NewSeqWriter(w)
 	p.audioOutRTP = s.NewStream(p.conf.Audio.Type, codecInfo.RTPClockRate)
 

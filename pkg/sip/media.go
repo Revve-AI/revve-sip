@@ -207,7 +207,7 @@ func (r *rtpStatsHandler) Close() {
 	}
 }
 
-func newRTPStatsWriter(mon *stats.CallMonitor, audioPayloadType uint8, dtmfPayloadType uint8, audioType string, dtmfType string, w rtp.WriteStream) rtp.WriteStream {
+func newRTPStatsWriter(log logger.Logger, mon *stats.CallMonitor, audioPayloadType uint8, dtmfPayloadType uint8, audioType string, dtmfType string, w rtp.WriteStream, writeErrors *atomic.Uint64) rtp.WriteStream {
 	return &rtpStatsWriter{
 		w:                w,
 		audioPayloadType: audioPayloadType,
@@ -215,6 +215,8 @@ func newRTPStatsWriter(mon *stats.CallMonitor, audioPayloadType uint8, dtmfPaylo
 		audioType:        audioType,
 		dtmfType:         dtmfType,
 		mon:              mon,
+		log:              log,
+		portWriteErrors:  writeErrors,
 	}
 }
 
@@ -225,6 +227,11 @@ type rtpStatsWriter struct {
 	audioType        string
 	dtmfType         string
 	mon              *stats.CallMonitor
+	log              logger.Logger
+	portWriteErrors  *atomic.Uint64
+
+	writeErrors  atomic.Uint64
+	lastErrorLog atomic.Int64 // unix ms
 }
 
 func (w *rtpStatsWriter) String() string {
@@ -248,7 +255,26 @@ func (w *rtpStatsWriter) WriteRTP(h *prtp.Header, payload []byte) (int, error) {
 		}
 		w.mon.RTPPacketSend(typ)
 	}
-	return w.w.WriteRTP(h, payload)
+	n, err := w.w.WriteRTP(h, payload)
+	if err != nil {
+		cnt := w.writeErrors.Add(1)
+		if w.portWriteErrors != nil {
+			w.portWriteErrors.Add(1)
+		}
+		now := time.Now().UnixMilli()
+		lastLog := w.lastErrorLog.Load()
+		// Log at most once per second to avoid flooding
+		if now-lastLog > 1000 {
+			if w.lastErrorLog.CompareAndSwap(lastLog, now) && w.log != nil {
+				w.log.Warnw("RTP write error", err,
+					"writeErrors", cnt,
+					"payloadType", h.PayloadType,
+					"seq", h.SequenceNumber,
+				)
+			}
+		}
+	}
+	return n, err
 }
 
 func newMediaWriterCount(w msdk.PCM16Writer, frames, samples *atomic.Uint64) msdk.PCM16Writer {

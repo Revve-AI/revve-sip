@@ -591,6 +591,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	joinDur := c.mon.JoinDur()
 
 	c.mon.InviteReq()
+	inviteStart := time.Now()
 
 	toUri := CreateURIFromUserAndAddress(c.sipConf.to, c.sipConf.address, TransportFrom(c.sipConf.transport))
 
@@ -605,6 +606,8 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		}
 		c.setExtraAttrs(nil, 0, nil, hdrs)
 	})
+	durCheck := time.Since(inviteStart)
+	c.log.Infow("SIP check duration (INVITE to provider response)", "dur_check", durCheck)
 	// Update SIPCallInfo with the SIP Call-ID after Invite
 	if sipCallID := c.cc.SIPCallID(); sipCallID != "" {
 		c.state.DeferUpdate(func(info *livekit.SIPCallInfo) {
@@ -657,7 +660,8 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		c.log.Infow("SIP accept failed", "error", err)
 		return err
 	}
-	joinDur()
+	dur := joinDur()
+	c.log.Infow("SIP join duration (INVITE to ACK)", "dur_join", dur)
 
 	c.setExtraAttrs(c.sipConf.headersToAttrs, c.sipConf.includeHeaders, c.cc, nil)
 	c.state.DeferUpdate(func(info *livekit.SIPCallInfo) {
