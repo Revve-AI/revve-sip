@@ -15,20 +15,34 @@ Measures the time from sending/receiving INVITE to getting the first response fr
 | Direction | What it measures |
 |-----------|------------------|
 | Inbound | INVITE received to dispatch response (trunk match + auth) |
-| Outbound | INVITE sent to provider 200 OK response |
+| Outbound | INVITE sent to provider 200 OK response (includes ring time — use `dur_provider` for actual provider latency) |
 
 **Log fields**:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `dur_check` | `time.Duration` | Signaling round-trip time |
+| Field | Type | Direction | Description |
+|-------|------|-----------|-------------|
+| `dur_check` | `time.Duration` | Both | Total signaling round-trip time. For outbound calls this includes ring/answer time. |
+| `dur_provider` | `time.Duration` | Outbound | Time from INVITE sent to first provisional response (100 Trying / 180 Ringing). This is the actual provider/network latency. |
+| `dur_ring` | `time.Duration` | Outbound | Time from first provisional response to 200 OK (ring/answer time, irrelevant for debugging provider latency). |
 
-**Example**:
+> **Note**: `dur_provider` and `dur_ring` are only present on outbound calls when the provider sends a provisional (1xx) response before 200 OK. If no provisional response is received, only `dur_check` is logged.
+
+**Example (inbound)**:
 ```
 INFO  SIP check duration (INVITE to provider response)  dur_check=245ms
 ```
 
-**Thresholds**:
+**Example (outbound with provisional response)**:
+```
+INFO  SIP check duration (INVITE to provider response)  dur_check=7.8s  dur_provider=320ms  dur_ring=7.48s
+```
+
+**Example (outbound without provisional response)**:
+```
+INFO  SIP check duration (INVITE to provider response)  dur_check=1.2s
+```
+
+**Thresholds** (use `dur_provider` for outbound, `dur_check` for inbound):
 
 | Value | Status |
 |-------|--------|

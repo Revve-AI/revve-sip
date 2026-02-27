@@ -407,7 +407,7 @@ func (h *rtpStreamStats) HandleRTP(hdr *prtp.Header, payload []byte) error {
 				h.stats.lateSum.Add(uint64(-diff))
 			} else if diff > 1 {
 				h.stats.gaps.Add(1)
-				h.stats.gapsSum.Add(uint64(diff))
+				h.stats.gapsSum.Add(uint64(diff - 1))
 			}
 		}
 

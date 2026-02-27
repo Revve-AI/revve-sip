@@ -592,6 +592,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 
 	c.mon.InviteReq()
 	inviteStart := time.Now()
+	var firstProvResp time.Time
 
 	toUri := CreateURIFromUserAndAddress(c.sipConf.to, c.sipConf.address, TransportFrom(c.sipConf.transport))
 
@@ -600,6 +601,9 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		if code == sip.StatusOK {
 			return // is set separately
 		}
+		if firstProvResp.IsZero() && code >= 100 && code < 200 {
+			firstProvResp = time.Now()
+		}
 		if !ringing && code >= sip.StatusRinging && code < sip.StatusOK {
 			ringing = true
 			c.setStatus(CallRinging)
@@ -607,7 +611,19 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		c.setExtraAttrs(nil, 0, nil, hdrs)
 	})
 	durCheck := time.Since(inviteStart)
-	c.log.Infow("SIP check duration (INVITE to provider response)", "dur_check", durCheck)
+	if !firstProvResp.IsZero() {
+		durProvider := firstProvResp.Sub(inviteStart)
+		durRing := durCheck - durProvider
+		c.log.Infow("SIP check duration (INVITE to provider response)",
+			"dur_check", durCheck,
+			"dur_provider", durProvider,
+			"dur_ring", durRing,
+		)
+	} else {
+		c.log.Infow("SIP check duration (INVITE to provider response)",
+			"dur_check", durCheck,
+		)
+	}
 	// Update SIPCallInfo with the SIP Call-ID after Invite
 	if sipCallID := c.cc.SIPCallID(); sipCallID != "" {
 		c.state.DeferUpdate(func(info *livekit.SIPCallInfo) {
