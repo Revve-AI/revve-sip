@@ -45,7 +45,7 @@ FROM debian:trixie-slim
 
 # install wget for health check
 RUN apt-get update && \
-    apt-get install -y libopus0 libopusfile0 libsoxr0 ca-certificates && \
+    apt-get install -y libopus0 libopusfile0 libsoxr0 ca-certificates tcpdump && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
