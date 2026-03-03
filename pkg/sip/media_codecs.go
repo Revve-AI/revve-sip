@@ -18,4 +18,5 @@ package sip
 import (
 	_ "github.com/livekit/media-sdk/dtmf"
 	_ "github.com/livekit/media-sdk/g711"
+	_ "github.com/livekit/media-sdk/g722"
 )
