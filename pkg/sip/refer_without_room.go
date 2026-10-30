@@ -30,12 +30,14 @@ func (c *inboundCall) handleReferWithoutRoom(ctx context.Context, tid traceid.ID
 	if err != nil {
 		c.log().Errorw("Cannot prepare media for refer", err)
 		c.referFailed.Store(true)
+		c.referCode.Store(int32(sip.StatusInternalServerError))
 		c.cc.RespondAndDrop(sip.StatusInternalServerError, "Internal Server Error")
 		return err
 	}
 	if err = c.cc.Accept(ctx, ans, nil); err != nil {
 		c.log().Errorw("Cannot accept call for refer", err)
-		c.referFailed.Store(true)
+		// A caller CANCEL or hangup is a normal end, not a failed transfer.
+		c.referFailed.Store(c.ctx.Err() == nil)
 		return err
 	}
 	c.media.EnableTimeout(true)
@@ -49,8 +51,10 @@ func (c *inboundCall) handleReferWithoutRoom(ctx context.Context, tid traceid.ID
 			code = int(st.Code)
 		}
 		c.log().Infow("refer without room failed", "error", err, "referTo", referTo, "sipCode", code)
-		c.referFailed.Store(true)
-		c.referCode.Store(int32(code))
+		if c.ctx.Err() == nil {
+			c.referFailed.Store(true)
+			c.referCode.Store(int32(code))
+		}
 		c.closeWithHangup(ctx)
 		return err
 	}

@@ -348,3 +348,58 @@ func TestAdmission_ReferNoNotify(t *testing.T) {
 	requireReleases(t, h.f, 1)
 	require.True(t, h.f.releases[0].ReferFailed)
 }
+
+func TestAdmission_ReferCallerHangup(t *testing.T) {
+	h := startReferCall(t, 5*time.Second)
+	h.waitRefer(t)
+	h.cli.Close()
+	requireReleases(t, h.f, 1)
+	require.False(t, h.f.releases[0].ReferFailed)
+	require.Equal(t, 0, h.f.releases[0].SIPCode)
+}
+
+func TestAdmission_ReferMediaError(t *testing.T) {
+	f := newFakeAdmission(t, func(w http.ResponseWriter, r *http.Request) {
+		writeDecision(w, map[string]any{"decision_id": "d1", "action": "refer", "target": referTestTarget})
+	})
+	testInviteWithConfBody(t, admissionHandler(), withAdmission(f.srv.URL), []byte("not an sdp"), func(tx sip.ClientTransaction) {
+		require.Equal(t, sip.StatusCode(180), expectFinal(t, tx).StatusCode)
+		require.Equal(t, sip.StatusCode(500), getResponseOrFail(t, tx).StatusCode)
+	})
+	requireReleases(t, f, 1)
+	require.True(t, f.releases[0].ReferFailed)
+	require.Equal(t, 500, f.releases[0].SIPCode)
+}
+
+func testInviteWithConfBody(t *testing.T, h Handler, mutate func(*config.Config), body []byte, test func(tx sip.ClientTransaction)) {
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+	localIP, err := config.GetLocalIP()
+	require.NoError(t, err)
+	addr := fmt.Sprintf("%s:%d", localIP, sipPort)
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+	conf := &config.Config{
+		SIPPort:       sipPort,
+		SIPPortListen: sipPort,
+		RTPPort:       rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+	}
+	mutate(conf)
+	s, err := NewService("", conf, mon, logger.LogRLogger(logr.Discard()), func(string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+	s.SetHandler(h)
+	require.NoError(t, s.Start())
+
+	ua, err := sipgo.NewUA(sipgo.WithUserAgent("a"))
+	require.NoError(t, err)
+	cl, err := sipgo.NewClient(ua)
+	require.NoError(t, err)
+	req := sip.NewRequest(sip.INVITE, sip.Uri{User: "b", Host: addr})
+	req.SetDestination(addr)
+	req.SetBody(body)
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	tx, err := cl.TransactionRequest(req)
+	require.NoError(t, err)
+	t.Cleanup(tx.Terminate)
+	test(tx)
+}
