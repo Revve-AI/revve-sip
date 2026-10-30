@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -260,22 +261,48 @@ func TestAdmission_CancelDuringAdmission(t *testing.T) {
 }
 
 func TestContactForTarget(t *testing.T) {
-	c, err := contactForTarget("sip:queue@pbx.example.com", "host.example.com")
+	c, err := contactForTarget("sip:queue@pbx.example.com", "carrier.example.com")
 	require.NoError(t, err)
 	require.Equal(t, "queue", c.Address.User)
 	require.Equal(t, "pbx.example.com", c.Address.Host)
 
-	for _, target := range []string{"+842873001234", "tel:+842873001234"} {
-		c, err = contactForTarget(target, "host.example.com")
+	for _, target := range []string{"+842873001234", "tel:+842873001234", "tel:+842873001234;phone-context=+84"} {
+		c, err = contactForTarget(target, "carrier.example.com")
 		require.NoError(t, err, target)
 		require.Equal(t, "+842873001234", c.Address.User, target)
-		require.Equal(t, "host.example.com", c.Address.Host, target)
+		require.Equal(t, "carrier.example.com", c.Address.Host, target)
 	}
 
-	for _, target := range []string{"http://x", "queue", ""} {
-		_, err = contactForTarget(target, "host.example.com")
+	for _, target := range []string{"http://x", "queue", "", "+1234567", "+1234567890123456", "+84abc12345", "tel:12345678"} {
+		_, err = contactForTarget(target, "carrier.example.com")
 		require.Error(t, err, target)
 	}
+}
+
+func TestCarrierHost(t *testing.T) {
+	src := netip.MustParseAddrPort("10.0.0.7:5060")
+	require.Equal(t, "carrier.example.com", carrierHost(sip.Uri{Host: "carrier.example.com"}, src))
+	require.Equal(t, "carrier.example.com:5070", carrierHost(sip.Uri{Host: "carrier.example.com", Port: 5070}, src))
+	require.Equal(t, "10.0.0.7", carrierHost(sip.Uri{}, src))
+	require.Equal(t, "[2001:db8::1]", carrierHost(sip.Uri{}, netip.MustParseAddrPort("[2001:db8::1]:5060")))
+}
+
+func TestAdmission_RedirectE164UsesFromHost(t *testing.T) {
+	f := newFakeAdmission(t, func(w http.ResponseWriter, r *http.Request) {
+		writeDecision(w, map[string]any{"decision_id": "d1", "action": "redirect", "target": "+84901234567"})
+	})
+	withFrom := func(req *sip.Request) {
+		from := &sip.FromHeader{Address: sip.Uri{User: "a", Host: "carrier.example.com"}, Params: sip.NewParams()}
+		from.Params.Add("tag", sip.GenerateTagN(16))
+		req.AppendHeader(from)
+	}
+	testInviteWithConfReq(t, admissionHandler(), withAdmission(f.srv.URL), nil, withFrom, func(tx sip.ClientTransaction) {
+		res := expectFinal(t, tx)
+		require.Equal(t, sip.StatusCode(302), res.StatusCode)
+		c := res.Contact()
+		require.Equal(t, "+84901234567", c.Address.User)
+		require.Equal(t, "carrier.example.com", c.Address.Host)
+	})
 }
 
 const referTestTarget = "sip:queue@pbx.example.com"
@@ -399,6 +426,10 @@ func TestAdmission_ReferMediaError(t *testing.T) {
 }
 
 func testInviteWithConfBody(t *testing.T, h Handler, mutate func(*config.Config), body []byte, test func(tx sip.ClientTransaction)) {
+	testInviteWithConfReq(t, h, mutate, body, nil, test)
+}
+
+func testInviteWithConfReq(t *testing.T, h Handler, mutate func(*config.Config), body []byte, edit func(*sip.Request), test func(tx sip.ClientTransaction)) {
 	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
 	localIP, err := config.GetLocalIP()
 	require.NoError(t, err)
@@ -421,10 +452,19 @@ func testInviteWithConfBody(t *testing.T, h Handler, mutate func(*config.Config)
 	require.NoError(t, err)
 	cl, err := sipgo.NewClient(ua)
 	require.NoError(t, err)
+	if body == nil {
+		offer, err := sdp.NewOffer(localIP, 0xB0B, sdp.EncryptionNone)
+		require.NoError(t, err)
+		body, err = offer.SDP.Marshal()
+		require.NoError(t, err)
+	}
 	req := sip.NewRequest(sip.INVITE, sip.Uri{User: "b", Host: addr})
 	req.SetDestination(addr)
 	req.SetBody(body)
 	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	if edit != nil {
+		edit(req)
+	}
 	tx, err := cl.TransactionRequest(req)
 	require.NoError(t, err)
 	t.Cleanup(tx.Terminate)

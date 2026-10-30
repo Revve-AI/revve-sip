@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -249,14 +251,52 @@ func admissionHeaders(hs Headers) map[string]string {
 	return out
 }
 
-// contactForTarget builds the Contact for a 302 from a redirect target.
-func contactForTarget(target, toHost string) (*sip.ContactHeader, error) {
+// carrierHost is the host for E.164 and tel: targets: the INVITE From host (the carrier side),
+// or the source address when From has no host. The To host is revve-sip itself.
+func carrierHost(from sip.Uri, src netip.AddrPort) string {
+	if from.Host != "" {
+		if from.Port > 0 {
+			return net.JoinHostPort(from.Host, strconv.Itoa(from.Port))
+		}
+		return from.Host
+	}
+	addr := src.Addr().Unmap()
+	if addr.Is6() {
+		return "[" + addr.String() + "]"
+	}
+	return addr.String()
+}
+
+func isE164(s string) bool {
+	if len(s) < 9 || len(s) > 16 || s[0] != '+' {
+		return false
+	}
+	for _, r := range s[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// contactForTarget builds the Contact for a 302 or REFER from a target. E.164 and tel:
+// targets go to the carrier host.
+func contactForTarget(target, host string) (*sip.ContactHeader, error) {
 	target = strings.TrimSpace(target)
 	if strings.HasPrefix(target, "tel:") {
 		target = strings.TrimPrefix(target, "tel:")
+		if i := strings.IndexByte(target, ';'); i >= 0 {
+			target = target[:i]
+		}
+		if !isE164(target) {
+			return nil, fmt.Errorf("unsupported tel target %q", target)
+		}
 	}
 	if strings.HasPrefix(target, "+") {
-		target = "sip:" + target + "@" + toHost
+		if !isE164(target) {
+			return nil, fmt.Errorf("invalid E.164 target %q", target)
+		}
+		target = "sip:" + target + "@" + host
 	}
 	var uri sip.Uri
 	if err := emiagosip.ParseUri(target, &uri); err != nil {
@@ -357,7 +397,7 @@ func (s *Server) admitInvite(
 		release(dec.SIPCode)
 		return nil, "", "", false, psrpc.NewErrorf(psrpc.PermissionDenied, "call rejected by admission")
 	case "redirect":
-		contact, cerr := contactForTarget(dec.Target, to.Host)
+		contact, cerr := contactForTarget(dec.Target, carrierHost(from, src))
 		if cerr != nil {
 			release(0)
 			return fallback("bad redirect target", cerr)
@@ -368,7 +408,7 @@ func (s *Server) admitInvite(
 		release(int(sip.StatusMovedTemporarily))
 		return nil, "", "", false, psrpc.NewErrorf(psrpc.Canceled, "call redirected by admission")
 	case "refer":
-		contact, cerr := contactForTarget(dec.Target, to.Host)
+		contact, cerr := contactForTarget(dec.Target, carrierHost(from, src))
 		if cerr != nil {
 			release(0)
 			return fallback("bad refer target", cerr)
