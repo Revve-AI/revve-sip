@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,14 +12,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/media-sdk/sdp"
+	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
+	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/sipgo"
 	"github.com/livekit/sipgo/sip"
 
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/siptest"
+	"github.com/livekit/sip/pkg/stats"
 )
 
 type fakeAdmission struct {
@@ -144,15 +150,6 @@ func TestAdmission_Down(t *testing.T) {
 	})
 }
 
-func TestAdmission_ReferIsFallbackForNow(t *testing.T) {
-	f := newFakeAdmission(t, func(w http.ResponseWriter, r *http.Request) {
-		writeDecision(w, map[string]any{"decision_id": "d1", "action": "refer", "target": "sip:x@y.example.com"})
-	})
-	testInviteWithConf(t, admissionHandler(), false, "a", "b", withAdmission(f.srv.URL), func(tx sip.ClientTransaction) {
-		require.Equal(t, sip.StatusCode(503), expectFinal(t, tx).StatusCode)
-	})
-}
-
 func TestAdmission_CachedFallbackThenDown(t *testing.T) {
 	var n atomic.Int32
 	f := newFakeAdmission(t, func(w http.ResponseWriter, r *http.Request) {
@@ -252,4 +249,102 @@ func TestContactForTarget(t *testing.T) {
 		_, err = contactForTarget(target, "host.example.com")
 		require.Error(t, err, target)
 	}
+}
+
+const referTestTarget = "sip:queue@pbx.example.com"
+
+type referHarness struct {
+	f      *fakeAdmission
+	refers chan *sip.Request
+	byes   chan struct{}
+	cli    *siptest.Client
+}
+
+func startReferCall(t *testing.T, notifyTimeout time.Duration) *referHarness {
+	t.Helper()
+	old := referNotifyTimeout
+	referNotifyTimeout = notifyTimeout
+	t.Cleanup(func() { referNotifyTimeout = old })
+
+	h := &referHarness{refers: make(chan *sip.Request, 1), byes: make(chan struct{}, 1)}
+	h.f = newFakeAdmission(t, func(w http.ResponseWriter, r *http.Request) {
+		writeDecision(w, map[string]any{"decision_id": "d1", "action": "refer", "target": referTestTarget})
+	})
+
+	localIP, err := config.GetLocalIP()
+	require.NoError(t, err)
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+	conf := &config.Config{
+		SIPPort:       sipPort,
+		SIPPortListen: sipPort,
+		RTPPort:       rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+	}
+	withAdmission(h.f.srv.URL)(conf)
+	s, err := NewService("", conf, mon, logger.LogRLogger(logr.Discard()), func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	t.Cleanup(s.Stop)
+	s.SetHandler(admissionHandler())
+	require.NoError(t, s.Start())
+
+	h.cli, err = siptest.NewClient("refer", siptest.ClientConfig{
+		Number:         "alice",
+		OnRefer:        func(req *sip.Request) { h.refers <- req },
+		OnBye:          func() { h.byes <- struct{}{} },
+		OnMediaTimeout: func() {},
+	})
+	require.NoError(t, err)
+	t.Cleanup(h.cli.Close)
+
+	addr := fmt.Sprintf("%s:%d", localIP, sipPort)
+	require.NoError(t, h.cli.Dial(addr, addr, "bob", nil))
+	return h
+}
+
+func (h *referHarness) waitRefer(t *testing.T) *sip.Request {
+	select {
+	case req := <-h.refers:
+		return req
+	case <-time.After(3 * time.Second):
+		t.Fatal("no REFER received")
+	}
+	return nil
+}
+
+func (h *referHarness) waitBye(t *testing.T, within time.Duration) {
+	select {
+	case <-h.byes:
+	case <-time.After(within):
+		t.Fatal("no BYE received")
+	}
+}
+
+func TestAdmission_ReferSuccess(t *testing.T) {
+	h := startReferCall(t, 5*time.Second)
+	req := h.waitRefer(t)
+	require.Equal(t, sip.REFER, req.Method)
+	require.Equal(t, "<"+referTestTarget+">", req.GetHeader("Refer-To").Value())
+	require.NoError(t, h.cli.SendNotify(req, "SIP/2.0 200 OK"))
+	h.waitBye(t, 3*time.Second)
+	requireReleases(t, h.f, 1)
+	require.False(t, h.f.releases[0].ReferFailed)
+}
+
+func TestAdmission_ReferRejectedByCarrier(t *testing.T) {
+	h := startReferCall(t, 5*time.Second)
+	req := h.waitRefer(t)
+	require.NoError(t, h.cli.SendNotify(req, "SIP/2.0 486 Busy Here"))
+	h.waitBye(t, 3*time.Second)
+	requireReleases(t, h.f, 1)
+	require.True(t, h.f.releases[0].ReferFailed)
+	require.Equal(t, 486, h.f.releases[0].SIPCode)
+}
+
+func TestAdmission_ReferNoNotify(t *testing.T) {
+	h := startReferCall(t, 500*time.Millisecond)
+	h.waitRefer(t)
+	h.waitBye(t, 3*time.Second)
+	requireReleases(t, h.f, 1)
+	require.True(t, h.f.releases[0].ReferFailed)
 }

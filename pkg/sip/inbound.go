@@ -464,10 +464,10 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	}
 
 	var admitExtra map[string]string
-	var decisionID string
+	var decisionID, referTarget string
 	if s.admission != nil {
 		var ok bool
-		admitExtra, decisionID, ok, err = s.admitInvite(ctx, log, cmon, cc, tx, callID, from, to, src, r.TrunkID, rheaders)
+		admitExtra, decisionID, referTarget, ok, err = s.admitInvite(ctx, log, cmon, cc, tx, callID, from, to, src, r.TrunkID, rheaders)
 		if !ok {
 			return err
 		}
@@ -476,6 +476,9 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	call = s.newInboundCall(ctx, tid, log, cmon, cc, callInfo, state, start, admitExtra)
 	call.decisionID = decisionID
 	call.joinDur = joinDur
+	if referTarget != "" {
+		return call.handleReferWithoutRoom(call.ctx, tid, req, referTarget)
+	}
 	return call.handleInvite(call.ctx, tid, req, r.TrunkID, s.conf)
 }
 
@@ -617,6 +620,8 @@ type inboundCall struct {
 	jitterBuf   bool
 	projectID   string
 	decisionID  string
+	referFailed atomic.Bool
+	referCode   atomic.Int32
 }
 
 func (s *Server) newInboundCall(
@@ -1203,7 +1208,7 @@ func (c *inboundCall) close(ctx context.Context, error bool, status CallStatus, 
 		}(c.tid)
 	}
 	if c.decisionID != "" && c.s.admission != nil {
-		c.s.admission.Release(c.call.LkCallId, false, 0)
+		c.s.admission.Release(c.call.LkCallId, c.referFailed.Load(), int(c.referCode.Load()))
 	}
 
 	c.cancel()

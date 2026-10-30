@@ -267,7 +267,7 @@ func contactForTarget(target, toHost string) (*sip.ContactHeader, error) {
 func (s *Server) admitInvite(
 	ctx context.Context, log logger.Logger, cmon *stats.CallMonitor, cc *sipInbound, tx sip.ServerTransaction,
 	callID string, from, to sip.Uri, src netip.AddrPort, trunkID string, rheaders Headers,
-) (extra map[string]string, decisionID string, ok bool, err error) {
+) (extra map[string]string, decisionID string, referTarget string, ok bool, err error) {
 	a := s.admission
 	type result struct {
 		dec AdmissionDecision
@@ -304,15 +304,15 @@ func (s *Server) admitInvite(
 				a.Release(callID, false, 0)
 			}
 		}()
-		return nil, "", false, psrpc.NewErrorf(psrpc.Canceled, "call cancelled during admission")
+		return nil, "", "", false, psrpc.NewErrorf(psrpc.Canceled, "call cancelled during admission")
 	}
 
-	fallback := func(why string, cause error) (map[string]string, string, bool, error) {
+	fallback := func(why string, cause error) (map[string]string, string, string, bool, error) {
 		code, reason := a.FallbackFor(to.User)
 		cmon.InviteErrorShort("admission-error")
 		log.Warnw("Rejecting inbound, admission failed", cause, "reason", why, "sipCode", code)
 		cc.RespondAndDrop(sip.StatusCode(code), sanitizeReason(reason))
-		return nil, "", false, psrpc.NewErrorf(psrpc.Unavailable, "admission failed: %s", why)
+		return nil, "", "", false, psrpc.NewErrorf(psrpc.Unavailable, "admission failed: %s", why)
 	}
 	if res.err != nil {
 		return fallback("error", res.err)
@@ -339,7 +339,7 @@ func (s *Server) admitInvite(
 		if len(extra) == 0 {
 			extra = nil
 		}
-		return extra, id, true, nil
+		return extra, id, "", true, nil
 	case "reject":
 		reason := dec.Reason
 		if reason == "" {
@@ -349,7 +349,7 @@ func (s *Server) admitInvite(
 		log.Infow("Rejecting inbound by admission", "sipCode", dec.SIPCode)
 		cc.RespondAndDrop(sip.StatusCode(dec.SIPCode), sanitizeReason(reason))
 		release(dec.SIPCode)
-		return nil, "", false, psrpc.NewErrorf(psrpc.PermissionDenied, "call rejected by admission")
+		return nil, "", "", false, psrpc.NewErrorf(psrpc.PermissionDenied, "call rejected by admission")
 	case "redirect":
 		contact, cerr := contactForTarget(dec.Target, to.Host)
 		if cerr != nil {
@@ -360,9 +360,15 @@ func (s *Server) admitInvite(
 		log.Infow("Redirecting inbound by admission", "target", dec.Target)
 		cc.RespondAndDropWithContact(sip.StatusMovedTemporarily, "Moved Temporarily", contact)
 		release(int(sip.StatusMovedTemporarily))
-		return nil, "", false, psrpc.NewErrorf(psrpc.Canceled, "call redirected by admission")
+		return nil, "", "", false, psrpc.NewErrorf(psrpc.Canceled, "call redirected by admission")
+	case "refer":
+		contact, cerr := contactForTarget(dec.Target, to.Host)
+		if cerr != nil {
+			release(0)
+			return fallback("bad refer target", cerr)
+		}
+		return nil, id, contact.Address.String(), true, nil
 	default:
-		// TODO(DEV-2479 Task 16): "refer" is handled like an admission error until then.
 		release(0)
 		return fallback("unsupported action "+dec.Action, nil)
 	}
