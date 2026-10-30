@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,7 +62,7 @@ func TestAdmissionDecideSendsAndParses(t *testing.T) {
 func TestAdmissionDecideActions(t *testing.T) {
 	for _, act := range []string{"accept", "redirect", "refer"} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Write([]byte(`{"decision_id":null,"action":"` + act + `","fallback":{"timeout_ms":1000,"sip_code":503,"reason":"x"}}`))
+			w.Write([]byte(`{"decision_id":null,"action":"` + act + `","target":"sip:x@y","fallback":{"timeout_ms":1000,"sip_code":503,"reason":"x"}}`))
 		}))
 		d, err := newTestAdmission(srv.URL).Decide(context.Background(), AdmissionRequest{To: "n"})
 		srv.Close()
@@ -81,27 +82,27 @@ func TestAdmissionDecideNon2xx(t *testing.T) {
 }
 
 func TestAdmissionDecideTimeoutAndCachedTimeout(t *testing.T) {
-	var delay time.Duration
+	var delay atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(delay)
+		time.Sleep(time.Duration(delay.Load()))
 		w.Write([]byte(`{"action":"accept","fallback":{"timeout_ms":300,"sip_code":480,"reason":"x"}}`))
 	}))
 	defer srv.Close()
 	a := newAdmissionClient(&config.AdmissionConfig{URL: srv.URL, DefaultTimeout: 200 * time.Millisecond, DefaultFallbackCode: 503})
 
-	delay = 600 * time.Millisecond
+	delay.Store(int64(600 * time.Millisecond))
 	_, err := a.Decide(context.Background(), AdmissionRequest{To: "n"})
 	require.Error(t, err)
 
-	delay = 0
+	delay.Store(0)
 	_, err = a.Decide(context.Background(), AdmissionRequest{To: "n"})
 	require.NoError(t, err)
 
 	// cached timeout is now 300ms: a 250ms response passes, a 500ms one fails
-	delay = 250 * time.Millisecond
+	delay.Store(int64(250 * time.Millisecond))
 	_, err = a.Decide(context.Background(), AdmissionRequest{To: "n"})
 	require.NoError(t, err)
-	delay = 500 * time.Millisecond
+	delay.Store(int64(500 * time.Millisecond))
 	_, err = a.Decide(context.Background(), AdmissionRequest{To: "n"})
 	require.Error(t, err)
 }
@@ -159,5 +160,29 @@ func TestAdmissionRelease(t *testing.T) {
 		require.EqualValues(t, 603, m["sip_code"])
 	case <-time.After(3 * time.Second):
 		t.Fatal("no release request")
+	}
+}
+
+func TestAdmissionDecideRejectsInvalid(t *testing.T) {
+	cases := map[string]string{
+		"empty":           `{}`,
+		"unknown":         `{"action":"nope","fallback":{"timeout_ms":300,"sip_code":480,"reason":"x"}}`,
+		"redirect no tgt": `{"action":"redirect","fallback":{"timeout_ms":300,"sip_code":480,"reason":"x"}}`,
+		"refer no tgt":    `{"action":"refer","fallback":{"timeout_ms":300,"sip_code":480,"reason":"x"}}`,
+		"reject 302":      `{"action":"reject","sip_code":302,"fallback":{"timeout_ms":300,"sip_code":480,"reason":"x"}}`,
+		"reject no code":  `{"action":"reject","fallback":{"timeout_ms":300,"sip_code":480,"reason":"x"}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			a := newTestAdmission(srv.URL)
+			_, err := a.Decide(context.Background(), AdmissionRequest{To: "n"})
+			require.Error(t, err)
+			code, _ := a.FallbackFor("n")
+			require.Equal(t, 503, code)
+		})
 	}
 }

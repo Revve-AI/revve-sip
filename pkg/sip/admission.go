@@ -180,6 +180,9 @@ func (a *admissionClient) Decide(ctx context.Context, req AdmissionRequest) (Adm
 	if err = json.NewDecoder(resp.Body).Decode(&dec); err != nil {
 		return AdmissionDecision{}, errors.Wrap(err, "admission response decode failed")
 	}
+	if err = validateAdmissionDecision(dec); err != nil {
+		return AdmissionDecision{}, err
+	}
 	dec.Reason = sanitizeReason(dec.Reason)
 	dec.Fallback.Reason = sanitizeReason(dec.Fallback.Reason)
 	a.setFallback(req.To, dec.Fallback.TimeoutMs, dec.Fallback.SIPCode, dec.Fallback.Reason)
@@ -204,4 +207,21 @@ func (a *admissionClient) Release(callID string, referFailed bool, sipCode int) 
 			a.log.Warnw("admission release failed", err, "callID", callID)
 		}
 	}()
+}
+
+func validateAdmissionDecision(dec AdmissionDecision) error {
+	switch dec.Action {
+	case "accept":
+	case "reject":
+		if dec.SIPCode < 400 || dec.SIPCode > 699 {
+			return fmt.Errorf("admission reject has invalid sip_code %d", dec.SIPCode)
+		}
+	case "redirect", "refer":
+		if dec.Target == "" {
+			return fmt.Errorf("admission %s has no target", dec.Action)
+		}
+	default:
+		return fmt.Errorf("admission returned unknown action %q", dec.Action)
+	}
+	return nil
 }
