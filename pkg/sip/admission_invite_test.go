@@ -234,3 +234,22 @@ func TestAdmission_CancelDuringAdmission(t *testing.T) {
 		expectNoResponse(t, tx)
 	})
 }
+
+func TestContactForTarget(t *testing.T) {
+	c, err := contactForTarget("sip:queue@pbx.example.com", "host.example.com")
+	require.NoError(t, err)
+	require.Equal(t, "queue", c.Address.User)
+	require.Equal(t, "pbx.example.com", c.Address.Host)
+
+	for _, target := range []string{"+842873001234", "tel:+842873001234"} {
+		c, err = contactForTarget(target, "host.example.com")
+		require.NoError(t, err, target)
+		require.Equal(t, "+842873001234", c.Address.User, target)
+		require.Equal(t, "host.example.com", c.Address.Host, target)
+	}
+
+	for _, target := range []string{"http://x", "queue", ""} {
+		_, err = contactForTarget(target, "host.example.com")
+		require.Error(t, err, target)
+	}
+}

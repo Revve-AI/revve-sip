@@ -14,6 +14,8 @@ import (
 
 	"github.com/pkg/errors"
 
+	// livekit/sipgo's sip.Uri is an alias of emiago's Uri and has no parser of its own.
+	// A livekit/sipgo bump that drops the alias would break contactForTarget.
 	emiagosip "github.com/emiago/sipgo/sip"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/psrpc"
@@ -244,19 +246,18 @@ func admissionHeaders(hs Headers) map[string]string {
 // contactForTarget builds the Contact for a 302 from a redirect target.
 func contactForTarget(target, toHost string) (*sip.ContactHeader, error) {
 	target = strings.TrimSpace(target)
+	if strings.HasPrefix(target, "tel:") {
+		target = strings.TrimPrefix(target, "tel:")
+	}
 	if strings.HasPrefix(target, "+") {
 		target = "sip:" + target + "@" + toHost
 	}
 	var uri sip.Uri
 	if err := emiagosip.ParseUri(target, &uri); err != nil {
-		digits := strings.TrimPrefix(target, "tel:")
-		if !strings.HasPrefix(target, "tel:") || digits == "" {
-			return nil, err
-		}
-		uri = sip.Uri{}
-		if err = emiagosip.ParseUri("sip:"+digits+"@"+toHost, &uri); err != nil {
-			return nil, err
-		}
+		return nil, err
+	}
+	if uri.Scheme != "sip" && uri.Scheme != "sips" {
+		return nil, fmt.Errorf("unsupported redirect target %q", target)
 	}
 	return &sip.ContactHeader{Address: uri}, nil
 }
