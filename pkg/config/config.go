@@ -69,6 +69,14 @@ type TCPConfig struct {
 	DialPort rtcconfig.PortRange `yaml:"dial_port"`
 }
 
+// AdmissionConfig configures the revve-web admission check done before answering an INVITE.
+type AdmissionConfig struct {
+	URL                 string        `yaml:"url"`
+	APIKey              string        `yaml:"api_key"`
+	DefaultTimeout      time.Duration `yaml:"default_timeout"`       // default 1s
+	DefaultFallbackCode int           `yaml:"default_fallback_code"` // default 503
+}
+
 type Config struct {
 	Redis     *redis.RedisConfig `yaml:"redis"`      // required
 	ApiKey    string             `yaml:"api_key"`    // required (env LIVEKIT_API_KEY)
@@ -84,6 +92,7 @@ type Config struct {
 	SIPRingingInterval time.Duration       `yaml:"sip_ringing_interval"` // from 1 sec up to 60 (default '1s')
 	TCP                *TCPConfig          `yaml:"tcp"`
 	TLS                *TLSConfig          `yaml:"tls"`
+	Admission          *AdmissionConfig    `yaml:"admission"`
 	RTPPort            rtcconfig.PortRange `yaml:"rtp_port"`
 	Logging            logger.Config       `yaml:"logging"`
 	ClusterID          string              `yaml:"cluster_id"` // cluster this instance belongs to
@@ -166,6 +175,14 @@ func (c *Config) Init() error {
 		}
 		if tc.ListenPort == 0 {
 			tc.ListenPort = tc.Port
+		}
+	}
+	if ac := c.Admission; ac != nil {
+		if ac.DefaultTimeout <= 0 {
+			ac.DefaultTimeout = time.Second
+		}
+		if ac.DefaultFallbackCode == 0 {
+			ac.DefaultFallbackCode = 503
 		}
 	}
 	if c.RTPPort.Start == 0 {
