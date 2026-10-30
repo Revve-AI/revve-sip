@@ -463,7 +463,18 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 		// ok
 	}
 
-	call = s.newInboundCall(ctx, tid, log, cmon, cc, callInfo, state, start, nil)
+	var admitExtra map[string]string
+	var decisionID string
+	if s.admission != nil {
+		var ok bool
+		admitExtra, decisionID, ok, err = s.admitInvite(ctx, log, cmon, cc, tx, callID, from, to, src, r.TrunkID, rheaders)
+		if !ok {
+			return err
+		}
+	}
+
+	call = s.newInboundCall(ctx, tid, log, cmon, cc, callInfo, state, start, admitExtra)
+	call.decisionID = decisionID
 	call.joinDur = joinDur
 	return call.handleInvite(call.ctx, tid, req, r.TrunkID, s.conf)
 }
@@ -605,6 +616,7 @@ type inboundCall struct {
 	stats       Stats
 	jitterBuf   bool
 	projectID   string
+	decisionID  string
 }
 
 func (s *Server) newInboundCall(
@@ -1190,6 +1202,9 @@ func (c *inboundCall) close(ctx context.Context, error bool, status CallStatus, 
 			}, c.state.callInfo, reason)
 		}(c.tid)
 	}
+	if c.decisionID != "" && c.s.admission != nil {
+		c.s.admission.Release(c.call.LkCallId, false, 0)
+	}
 
 	c.cancel()
 }
@@ -1510,6 +1525,10 @@ func (c *sipInbound) respond(status sip.StatusCode, reason string) {
 }
 
 func (c *sipInbound) respondWithData(status sip.StatusCode, reason string, contentType string, body []byte) {
+	c.respondWithContact(status, reason, contentType, body, c.contact)
+}
+
+func (c *sipInbound) respondWithContact(status sip.StatusCode, reason string, contentType string, body []byte, contact *sip.ContactHeader) {
 	if c.inviteTx == nil {
 		return
 	}
@@ -1521,7 +1540,7 @@ func (c *sipInbound) respondWithData(status sip.StatusCode, reason string, conte
 	r.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, NOTIFY, REFER, MESSAGE, OPTIONS, INFO, SUBSCRIBE"))
 	if status >= 200 {
 		// For an ACK to error statuses.
-		r.AppendHeader(c.contact)
+		r.AppendHeader(contact)
 	}
 	c.addExtraHeaders(r)
 	_ = c.inviteTx.Respond(r)
@@ -1532,6 +1551,15 @@ func (c *sipInbound) RespondAndDrop(status sip.StatusCode, reason string) {
 	defer c.mu.Unlock()
 	c.stopRinging()
 	c.respond(status, reason)
+	c.drop()
+}
+
+// RespondAndDropWithContact is like RespondAndDrop, but sends the given Contact instead of our own (for 3xx).
+func (c *sipInbound) RespondAndDropWithContact(status sip.StatusCode, reason string, contact *sip.ContactHeader) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stopRinging()
+	c.respondWithContact(status, reason, "", nil, contact)
 	c.drop()
 }
 

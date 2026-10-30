@@ -7,14 +7,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 
+	emiagosip "github.com/emiago/sipgo/sip"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/psrpc"
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/stats"
 	"github.com/livekit/sipgo/sip"
 )
 
@@ -224,4 +228,141 @@ func validateAdmissionDecision(dec AdmissionDecision) error {
 		return fmt.Errorf("admission returned unknown action %q", dec.Action)
 	}
 	return nil
+}
+
+func admissionHeaders(hs Headers) map[string]string {
+	out := make(map[string]string, len(hs))
+	for _, h := range hs {
+		name := strings.ToLower(h.Name())
+		if _, ok := out[name]; !ok {
+			out[name] = h.Value()
+		}
+	}
+	return out
+}
+
+// contactForTarget builds the Contact for a 302 from a redirect target.
+func contactForTarget(target, toHost string) (*sip.ContactHeader, error) {
+	target = strings.TrimSpace(target)
+	if strings.HasPrefix(target, "+") {
+		target = "sip:" + target + "@" + toHost
+	}
+	var uri sip.Uri
+	if err := emiagosip.ParseUri(target, &uri); err != nil {
+		digits := strings.TrimPrefix(target, "tel:")
+		if !strings.HasPrefix(target, "tel:") || digits == "" {
+			return nil, err
+		}
+		uri = sip.Uri{}
+		if err = emiagosip.ParseUri("sip:"+digits+"@"+toHost, &uri); err != nil {
+			return nil, err
+		}
+	}
+	return &sip.ContactHeader{Address: uri}, nil
+}
+
+// admitInvite asks revve-web whether to answer the call. ok=false means the INVITE was
+// already answered (or dropped) and the caller must return err.
+func (s *Server) admitInvite(
+	ctx context.Context, log logger.Logger, cmon *stats.CallMonitor, cc *sipInbound, tx sip.ServerTransaction,
+	callID string, from, to sip.Uri, src netip.AddrPort, trunkID string, rheaders Headers,
+) (extra map[string]string, decisionID string, ok bool, err error) {
+	a := s.admission
+	type result struct {
+		dec AdmissionDecision
+		err error
+	}
+	dctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan result, 1)
+	go func() {
+		dec, err := a.Decide(dctx, AdmissionRequest{
+			CallID:    callID,
+			SIPCallID: cc.SIPCallID(),
+			From:      from.User,
+			To:        to.User,
+			Headers:   admissionHeaders(rheaders),
+			SourceIP:  src.Addr().String(),
+			TrunkID:   trunkID,
+		})
+		ch <- result{dec, err}
+	}()
+
+	var res result
+	select {
+	case res = <-ch:
+	case creq := <-tx.Cancels():
+		cancel()
+		close(cc.cancelled)
+		_ = tx.Respond(sip.NewResponseFromRequest(creq, sip.StatusOK, "OK", nil))
+		cc.RespondAndDrop(sip.StatusRequestTerminated, "Request Terminated")
+		cmon.InviteErrorShort("admission-cancelled")
+		log.Infow("Caller cancelled while waiting for admission")
+		go func() {
+			if r := <-ch; r.err == nil && r.dec.DecisionID != nil {
+				a.Release(callID, false, 0)
+			}
+		}()
+		return nil, "", false, psrpc.NewErrorf(psrpc.Canceled, "call cancelled during admission")
+	}
+
+	fallback := func(why string, cause error) (map[string]string, string, bool, error) {
+		code, reason := a.FallbackFor(to.User)
+		cmon.InviteErrorShort("admission-error")
+		log.Warnw("Rejecting inbound, admission failed", cause, "reason", why, "sipCode", code)
+		cc.RespondAndDrop(sip.StatusCode(code), sanitizeReason(reason))
+		return nil, "", false, psrpc.NewErrorf(psrpc.Unavailable, "admission failed: %s", why)
+	}
+	if res.err != nil {
+		return fallback("error", res.err)
+	}
+	dec := res.dec
+	id := ""
+	if dec.DecisionID != nil {
+		id = *dec.DecisionID
+	}
+	release := func(code int) {
+		if id != "" {
+			a.Release(callID, false, code)
+		}
+	}
+	switch dec.Action {
+	case "accept":
+		extra = map[string]string{}
+		if id != "" {
+			extra["revve.routing.decision_id"] = id
+		}
+		if dec.CallBotID != "" {
+			extra["revve.routing.call_bot_id"] = dec.CallBotID
+		}
+		if len(extra) == 0 {
+			extra = nil
+		}
+		return extra, id, true, nil
+	case "reject":
+		reason := dec.Reason
+		if reason == "" {
+			reason = sipStatus(sip.StatusCode(dec.SIPCode))
+		}
+		cmon.InviteErrorShort("admission-reject")
+		log.Infow("Rejecting inbound by admission", "sipCode", dec.SIPCode)
+		cc.RespondAndDrop(sip.StatusCode(dec.SIPCode), sanitizeReason(reason))
+		release(dec.SIPCode)
+		return nil, "", false, psrpc.NewErrorf(psrpc.PermissionDenied, "call rejected by admission")
+	case "redirect":
+		contact, cerr := contactForTarget(dec.Target, to.Host)
+		if cerr != nil {
+			release(0)
+			return fallback("bad redirect target", cerr)
+		}
+		cmon.InviteErrorShort("admission-redirect")
+		log.Infow("Redirecting inbound by admission", "target", dec.Target)
+		cc.RespondAndDropWithContact(sip.StatusMovedTemporarily, "Moved Temporarily", contact)
+		release(int(sip.StatusMovedTemporarily))
+		return nil, "", false, psrpc.NewErrorf(psrpc.Canceled, "call redirected by admission")
+	default:
+		// TODO(DEV-2479 Task 16): "refer" is handled like an admission error until then.
+		release(0)
+		return fallback("unsupported action "+dec.Action, nil)
+	}
 }

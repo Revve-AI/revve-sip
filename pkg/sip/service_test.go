@@ -98,6 +98,10 @@ func (h TestHandler) OnSessionEnd(ctx context.Context, callIdentifier *CallIdent
 }
 
 func testInvite(t *testing.T, h Handler, hidden bool, from, to string, test func(tx sip.ClientTransaction)) {
+	testInviteWithConf(t, h, hidden, from, to, nil, test)
+}
+
+func testInviteWithConf(t *testing.T, h Handler, hidden bool, from, to string, mutate func(*config.Config), test func(tx sip.ClientTransaction)) {
 	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
 	localIP, err := config.GetLocalIP()
 	require.NoError(t, err)
@@ -109,12 +113,16 @@ func testInvite(t *testing.T, h Handler, hidden bool, from, to string, test func
 
 	// Use a no-op logger to avoid panics from async logging after test completion
 	log := logger.LogRLogger(logr.Discard())
-	s, err := NewService("", &config.Config{
+	conf := &config.Config{
 		HideInboundPort: hidden,
 		SIPPort:         sipPort,
 		SIPPortListen:   sipPort,
 		RTPPort:         rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
-	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	}
+	if mutate != nil {
+		mutate(conf)
+	}
+	s, err := NewService("", conf, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
 	require.NoError(t, err)
 	require.NotNil(t, s)
 	t.Cleanup(s.Stop)
