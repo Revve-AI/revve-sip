@@ -157,6 +157,8 @@ type Server struct {
 	conf    *config.Config
 	sconf   *ServiceConfig
 
+	admission *admissionClient
+
 	res mediaRes
 }
 
@@ -186,6 +188,7 @@ func NewServer(region string, conf *config.Config, log logger.Logger, mon *stats
 		mon:         mon,
 		getIOClient: getIOClient,
 		getRoom:     DefaultGetRoomFunc,
+		admission:   newAdmissionClient(conf.Admission),
 		byRemoteTag: make(map[RemoteTag]*inboundCall),
 		byLocalTag:  make(map[LocalTag]*inboundCall),
 		byCallID:    make(map[string]*inboundCall),

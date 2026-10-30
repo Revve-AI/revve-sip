@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/at-wat/ebml-go v0.17.1
+	github.com/emiago/sipgo v1.1.0
 	github.com/frostbyte73/core v0.1.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/icholy/digest v1.1.0
@@ -77,7 +78,6 @@ require (
 	github.com/docker/cli v29.2.0+incompatible // indirect
 	github.com/docker/go-connections v0.6.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
-	github.com/emiago/sipgo v1.1.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/gammazero/deque v1.1.0 // indirect
 	github.com/go-jose/go-jose/v3 v3.0.5 // indirect
