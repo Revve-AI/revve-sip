@@ -299,11 +299,9 @@ func (s *Server) admitInvite(
 		cc.RespondAndDrop(sip.StatusRequestTerminated, "Request Terminated")
 		cmon.InviteErrorShort("admission-cancelled")
 		log.Infow("Caller cancelled while waiting for admission")
-		go func() {
-			if r := <-ch; r.err == nil && r.dec.DecisionID != nil {
-				a.Release(callID, false, 0)
-			}
-		}()
+		// revve-web may still finish the decision and take slots. Release is idempotent and,
+		// before a decision exists, makes revve-web refuse the late admission.
+		a.Release(callID, false, 0)
 		return nil, "", "", false, psrpc.NewErrorf(psrpc.Canceled, "call cancelled during admission")
 	}
 
@@ -315,6 +313,8 @@ func (s *Server) admitInvite(
 		return nil, "", "", false, psrpc.NewErrorf(psrpc.Unavailable, "admission failed: %s", why)
 	}
 	if res.err != nil {
+		// A timed-out request can still complete in revve-web and hold slots.
+		a.Release(callID, false, 0)
 		return fallback("error", res.err)
 	}
 	dec := res.dec

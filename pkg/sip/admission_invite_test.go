@@ -150,6 +150,32 @@ func TestAdmission_Down(t *testing.T) {
 	})
 }
 
+func TestAdmission_DownReleases(t *testing.T) {
+	f := newFakeAdmission(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) })
+	testInviteWithConf(t, admissionHandler(), false, "a", "b", withAdmission(f.srv.URL), func(tx sip.ClientTransaction) {
+		require.Equal(t, sip.StatusCode(503), expectFinal(t, tx).StatusCode)
+	})
+	requireReleases(t, f, 1)
+}
+
+func TestAdmission_TimeoutReleases(t *testing.T) {
+	f := newFakeAdmission(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(1500 * time.Millisecond):
+			writeDecision(w, map[string]any{"decision_id": "d1", "action": "accept"})
+		case <-r.Context().Done():
+		}
+	})
+	mutate := func(c *config.Config) {
+		withAdmission(f.srv.URL)(c)
+		c.Admission.DefaultTimeout = 300 * time.Millisecond
+	}
+	testInviteWithConf(t, admissionHandler(), false, "a", "b", mutate, func(tx sip.ClientTransaction) {
+		require.Equal(t, sip.StatusCode(503), expectFinal(t, tx).StatusCode)
+	})
+	requireReleases(t, f, 1)
+}
+
 func TestAdmission_CachedFallbackThenDown(t *testing.T) {
 	var n atomic.Int32
 	f := newFakeAdmission(t, func(w http.ResponseWriter, r *http.Request) {
@@ -230,6 +256,7 @@ func TestAdmission_CancelDuringAdmission(t *testing.T) {
 		require.Equal(t, sip.INVITE, res.CSeq().MethodName)
 		expectNoResponse(t, tx)
 	})
+	requireReleases(t, f, 1)
 }
 
 func TestContactForTarget(t *testing.T) {
