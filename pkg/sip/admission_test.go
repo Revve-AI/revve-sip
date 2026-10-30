@@ -186,3 +186,17 @@ func TestAdmissionDecideRejectsInvalid(t *testing.T) {
 		})
 	}
 }
+
+func TestAdmissionZeroFallbackKeepsDefaults(t *testing.T) {
+	a := newTestAdmission("http://x")
+	a.setFallback("n", 300, 480, "Gone")
+	a.setFallback("n", 0, 0, "")
+	require.Equal(t, time.Second, a.timeoutFor("n"))
+	code, reason := a.FallbackFor("n")
+	require.Equal(t, 503, code)
+	require.Equal(t, "Service Unavailable", reason)
+	a.mu.Lock()
+	_, cached := a.fallback["n"]
+	a.mu.Unlock()
+	require.False(t, cached)
+}

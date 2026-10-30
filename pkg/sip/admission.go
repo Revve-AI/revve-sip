@@ -109,9 +109,15 @@ func clampAdmissionTimeout(d time.Duration) time.Duration {
 	return d
 }
 
+// setFallback caches the rule fallback for the dialed number. Zero values mean the number
+// has no rule, so the entry is dropped and the config defaults apply.
 func (a *admissionClient) setFallback(to string, timeoutMs, code int, reason string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if timeoutMs <= 0 && code == 0 {
+		delete(a.fallback, to)
+		return
+	}
 	a.fallback[to] = admissionFallback{
 		timeout: time.Duration(timeoutMs) * time.Millisecond,
 		code:    code,
